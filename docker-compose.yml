@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+  backend:
+    build: ./backend
+    container_name: job-backend
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: jobautomation
+      POSTGRES_USER: jobuser
+      POSTGRES_PASSWORD: jobpass
+      POSTGRES_PORT: 5432
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    container_name: job-db
+    environment:
+      POSTGRES_USER: jobuser
+      POSTGRES_PASSWORD: jobpass
+      POSTGRES_DB: jobautomation
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/data:/var/lib/postgresql/data
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=db
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=jobautomation
+      - DB_POSTGRESDB_USER=jobuser
+      - DB_POSTGRESDB_PASSWORD=jobpass
+      - N8N_BASIC_AUTH_ACTIVE=false
+      - GENERIC_TIMEZONE=America/Los_Angeles
+      # --- START OF REQUIRED FIX ---
+      # This key ensures credential encryption/decryption is consistent across restarts.
+      # REPLACE 'YOUR_LONG_RANDOM_ENCRYPTION_KEY_HERE' with a strong, random value.
+      - N8N_ENCRYPTION_KEY=YOUR_LONG_RANDOM_ENCRYPTION_KEY_HERE
+      # Setting this to true avoids the "Unauthorized" error when the container restarts.
+      - N8N_USER_MANAGEMENT_DISABLED=true
+      # --- END OF REQUIRED FIX ---
+    volumes:
+      # You need a persistent volume for n8n's workflow data and settings
+      - ./n8n/data:/home/node/.n8n
+    depends_on:
+      - db
