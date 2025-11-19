@@ -1,8 +1,15 @@
-from typing import List, Optional
-from pydantic import BaseModel
-from fastapi import Body
+from typing import List, Optional, Union
+from datetime import datetime
 
-# --- Clients ---
+from fastapi import FastAPI, Body
+from pydantic import BaseModel
+
+from .db import get_conn
+
+app = FastAPI(title="Job Scraper API")
+
+
+# -------------------- Clients --------------------
 
 class Client(BaseModel):
     id: int
@@ -10,12 +17,13 @@ class Client(BaseModel):
     email: Optional[str] = None
     is_active: bool
 
+
 class ClientCreate(BaseModel):
     name: str
     email: Optional[str] = None
 
 
-# --- Search Profiles ---
+# -------------------- Search Profiles --------------------
 
 class SearchProfile(BaseModel):
     id: int
@@ -26,6 +34,7 @@ class SearchProfile(BaseModel):
     locations: List[str]
     is_active: bool
 
+
 class SearchProfileCreate(BaseModel):
     name: str
     platforms: List[str]
@@ -33,7 +42,7 @@ class SearchProfileCreate(BaseModel):
     locations: List[str]
 
 
-# --- Jobs ingest model ---
+# -------------------- Job Ingest --------------------
 
 class JobIngest(BaseModel):
     client_id: int
@@ -47,6 +56,52 @@ class JobIngest(BaseModel):
     raw_description: Optional[str] = None
     match_score: Optional[int] = None
 
+
+# -------------------- Jobs Out --------------------
+
+class JobOut(BaseModel):
+    id: int
+    client_id: int
+    profile_id: int
+    source: str
+    external_id: Optional[str] = None
+    title: str
+    company: Optional[str] = None
+    location: Optional[str] = None
+    job_link: str
+    scraped_at: datetime
+
+
+class PendingJob(BaseModel):
+    id: int
+    client_id: int
+    profile_id: int
+    source: str
+    external_id: Optional[str] = None
+    title: str
+    company: Optional[str] = None
+    location: Optional[str] = None
+    job_link: str
+    raw_description: Optional[str] = None
+    match_score: Optional[int] = None
+
+
+# -------------------- Job Application Results --------------------
+
+class JobApplicationResult(BaseModel):
+    job_id: int
+    client_id: int
+    provider: str       # 'dice', 'indeed', 'linkedin', etc.
+    status: str         # 'PENDING', 'APPLIED', 'FAILED', 'SKIPPED'
+    application_url: Optional[str] = None
+    error_message: Optional[str] = None
+    applied_at: Optional[datetime] = None
+
+
+# ============================================================
+#  CLIENT ENDPOINTS
+# ============================================================
+
 @app.get("/clients", response_model=List[Client])
 def list_clients():
     with get_conn() as conn, conn.cursor() as cur:
@@ -54,6 +109,7 @@ def list_clients():
             "SELECT id, name, email, is_active FROM clients ORDER BY id;"
         )
         return cur.fetchall()
+
 
 @app.post("/clients", response_model=Client)
 def create_client(payload: ClientCreate):
@@ -67,7 +123,12 @@ def create_client(payload: ClientCreate):
             (payload.name, payload.email),
         )
         return cur.fetchone()
-    
+
+
+# ============================================================
+#  SEARCH PROFILE ENDPOINTS
+# ============================================================
+
 @app.get("/clients/{client_id}/profiles", response_model=List[SearchProfile])
 def list_profiles(client_id: int):
     with get_conn() as conn, conn.cursor() as cur:
@@ -103,7 +164,12 @@ def create_profile(client_id: int, payload: SearchProfileCreate):
             ),
         )
         return cur.fetchone()
-    
+
+
+# ============================================================
+#  INTERNAL: PROFILES TO RUN (for n8n)
+# ============================================================
+
 @app.get("/internal/search-profiles-to-run", response_model=List[SearchProfile])
 def get_profiles_to_run():
     with get_conn() as conn, conn.cursor() as cur:
@@ -118,70 +184,184 @@ def get_profiles_to_run():
         return cur.fetchall()
 
 
+# ============================================================
+#  INTERNAL: JOB INGESTION (1 or many)
+# ============================================================
 
 @app.post("/internal/jobs/ingest")
-def ingest_jobs(jobs: List[JobIngest] = Body(...)):
-    if not jobs:
-        return {"inserted": 0, "updated": 0}
+def ingest_jobs(
+    jobs: Union[JobIngest, List[JobIngest]] = Body(...),
+):
+    """
+    Ingest one or many jobs.
 
-    inserted = 0
-    updated = 0
+    - If the body is a single object: { ... }  -> wrap in a list.
+    - If the body is a list: [ {...}, {...} ] -> use directly.
+    """
+    if isinstance(jobs, JobIngest):
+        jobs_list: List[JobIngest] = [jobs]
+    else:
+        jobs_list = jobs
+
+    if not jobs_list:
+        return {"total_processed": 0}
+
+    job_values = [
+        (
+            job.client_id,
+            job.profile_id,
+            job.source,
+            job.external_id,
+            job.title,
+            job.company,
+            job.location,
+            job.job_link,
+            job.raw_description,
+            job.match_score,
+        )
+        for job in jobs_list
+    ]
+
+    sql_query = """
+    INSERT INTO jobs (
+        client_id, profile_id, source, external_id,
+        title, company, location, job_link,
+        raw_description, match_score
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (client_id, source, job_link)
+    DO UPDATE SET
+        profile_id = EXCLUDED.profile_id,
+        external_id = EXCLUDED.external_id,
+        title = EXCLUDED.title,
+        company = EXCLUDED.company,
+        location = EXCLUDED.location,
+        raw_description = EXCLUDED.raw_description,
+        match_score = EXCLUDED.match_score;
+    """
 
     with get_conn() as conn, conn.cursor() as cur:
-        for job in jobs:
-            cur.execute(
-                """
-                INSERT INTO jobs (
-                    client_id, profile_id, source, external_id,
-                    title, company, location, job_link,
-                    raw_description, match_score
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (client_id, source, job_link)
-                DO UPDATE SET
-                    title = EXCLUDED.title,
-                    company = EXCLUDED.company,
-                    location = EXCLUDED.location,
-                    raw_description = EXCLUDED.raw_description,
-                    match_score = EXCLUDED.match_score;
-                """,
-                (
-                    job.client_id,
-                    job.profile_id,
-                    job.source,
-                    job.external_id,
-                    job.title,
-                    job.company,
-                    job.location,
-                    job.job_link,
-                    job.raw_description,
-                    job.match_score,
-                ),
+        cur.executemany(sql_query, job_values)
+        total_processed = cur.rowcount
+
+    return {"total_processed": total_processed}
+
+
+# ============================================================
+#  INTERNAL: GET PENDING JOBS FOR AUTO-APPLY
+# ============================================================
+
+@app.get("/internal/jobs/pending", response_model=List[PendingJob])
+def get_pending_jobs(client_id: int, limit: int = 20):
+    """
+    Return jobs for a client that do NOT yet have a job_applications record.
+
+    These are the jobs n8n should try to auto-apply for.
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                j.id,
+                j.client_id,
+                j.profile_id,
+                j.source,
+                j.external_id,
+                j.title,
+                j.company,
+                j.location,
+                j.job_link,
+                j.raw_description,
+                j.match_score
+            FROM jobs j
+            LEFT JOIN job_applications a
+                ON a.job_id = j.id
+               AND a.client_id = j.client_id
+               AND a.status IN ('APPLIED', 'SKIPPED')
+            WHERE j.client_id = %s
+              AND a.id IS NULL
+            ORDER BY j.scraped_at DESC
+            LIMIT %s;
+            """,
+            (client_id, limit),
+        )
+        return cur.fetchall()
+
+
+# ============================================================
+#  INTERNAL: SAVE JOB APPLICATION RESULTS
+# ============================================================
+
+@app.post("/internal/jobs/applications/result")
+def save_application_results(
+    results: Union[JobApplicationResult, List[JobApplicationResult]] = Body(...),
+):
+    """
+    Save one or many job application results coming back from n8n.
+
+    Each result upserts into job_applications on (job_id, client_id).
+    """
+    if isinstance(results, JobApplicationResult):
+        res_list: List[JobApplicationResult] = [results]
+    else:
+        res_list = results
+
+    if not res_list:
+        return {"total_processed": 0}
+
+    values = []
+    for r in res_list:
+        applied_at = r.applied_at or datetime.utcnow()
+        values.append(
+            (
+                r.job_id,
+                r.client_id,
+                r.provider,
+                r.status,
+                r.application_url,
+                r.error_message,
+                applied_at,
             )
-            # Insert vs update detection is optional; we can just return total.
-            inserted += 1  # or smarter rowcount logic if you want
+        )
 
-    return {"inserted": inserted, "updated": updated}
+    sql = """
+    INSERT INTO job_applications (
+        job_id,
+        client_id,
+        provider,
+        status,
+        application_url,
+        error_message,
+        applied_at
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (job_id, client_id)
+    DO UPDATE SET
+        provider = EXCLUDED.provider,
+        status = EXCLUDED.status,
+        application_url = EXCLUDED.application_url,
+        error_message = EXCLUDED.error_message,
+        applied_at = EXCLUDED.applied_at;
+    """
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.executemany(sql, values)
+        total_processed = cur.rowcount
+
+    return {"total_processed": total_processed}
 
 
-class JobOut(BaseModel):
-    id: int
-    client_id: int
-    profile_id: int
-    source: str
-    title: str
-    company: str | None = None
-    location: str | None = None
-    job_link: str
-    scraped_at: str
+# ============================================================
+#  LIST JOBS FOR A CLIENT (for debugging / UI)
+# ============================================================
 
 @app.get("/clients/{client_id}/jobs", response_model=List[JobOut])
 def list_jobs_for_client(client_id: int, limit: int = 50):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, client_id, profile_id, source, title, company, location,
-                   job_link, scraped_at
+            SELECT id, client_id, profile_id, source, external_id, title,
+                   company, location, job_link, scraped_at
             FROM jobs
             WHERE client_id = %s
             ORDER BY scraped_at DESC
@@ -190,5 +370,3 @@ def list_jobs_for_client(client_id: int, limit: int = 50):
             (client_id, limit),
         )
         return cur.fetchall()
-
-
