@@ -4,6 +4,11 @@ from datetime import datetime
 from fastapi import FastAPI, Body
 from pydantic import BaseModel
 
+from fastapi import UploadFile, File, HTTPException
+import io
+import re
+from .scorer import extract_text_from_pdf, calculate_match_score
+
 from .db import get_conn
 
 app = FastAPI(title="Job Scraper API")
@@ -83,7 +88,14 @@ class PendingJob(BaseModel):
     location: Optional[str] = None
     job_link: str
     raw_description: Optional[str] = None
-    match_score: Optional[int] = None
+    match_score: Optional[int] = None  # from scraper / later LLM
+
+    # PHASE 2 – queue fields
+    queue_score: int                   # our computed ranking score (0+)
+    is_senior: bool
+    is_recruiter: bool
+    matched_keywords: List[str] = []   # which profile keywords hit
+
 
 
 # -------------------- Job Application Results --------------------
@@ -370,3 +382,79 @@ def list_jobs_for_client(client_id: int, limit: int = 50):
             (client_id, limit),
         )
         return cur.fetchall()
+@app.post("/clients/{client_id}/resume")
+async def upload_resume(client_id: int, file: UploadFile = File(...)):
+    """
+    Upload a PDF resume, extract text, and save it to the client record.
+    """
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    # 1. Read file
+    file_content = await file.read()
+    file_stream = io.BytesIO(file_content)
+    
+    # 2. Extract text
+    text = extract_text_from_pdf(file_stream)
+    
+    if not text:
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        
+    # 3. Save to DB
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE clients SET resume_text = %s WHERE id = %s",
+            (text, client_id)
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Client not found")
+            
+    return {"message": "Resume uploaded and text extracted successfully", "length": len(text)}
+
+
+# ============================================================
+#  SCORING ENDPOINT (Trigger this from n8n or UI)
+# ============================================================
+
+@app.post("/internal/jobs/score")
+def score_unscored_jobs(client_id: int, limit: int = 50):
+    """
+    Finds jobs with no score, compares them to the client's resume, and updates the score.
+    """
+    scored_count = 0
+    with get_conn() as conn, conn.cursor() as cur:
+        # 1. Get Client Resume
+        cur.execute("SELECT resume_text FROM clients WHERE id = %s", (client_id,))
+        res = cur.fetchone()
+        if not res or not res[0]:
+            raise HTTPException(status_code=400, detail="Client has no resume uploaded")
+        
+        resume_text = res[0]
+        
+        # 2. Get Unscored Jobs
+        cur.execute(
+            """
+            SELECT id, raw_description 
+            FROM jobs 
+            WHERE client_id = %s AND match_score IS NULL AND raw_description IS NOT NULL
+            LIMIT %s
+            """,
+            (client_id, limit)
+        )
+        jobs_to_score = cur.fetchall()
+        
+        scored_count = 0
+        
+        # 3. Loop and Score
+        for job_id, job_desc in jobs_to_score:
+            score = calculate_match_score(resume_text, job_desc)
+            
+            # Update Job
+            cur.execute(
+                "UPDATE jobs SET match_score = %s WHERE id = %s",
+                (score, job_id)
+            )
+            scored_count += 1
+        conn.commit()
+            
+    return {"processed": scored_count}
