@@ -1,7 +1,0 @@
-{
-  "name": "installed-nodes",
-  "private": true,
-  "dependencies": {
-    "@apify/n8n-nodes-apify": "0.6.4"
-  }
-}
